@@ -2,12 +2,10 @@
 
 [CmdletBinding()]
 param(
-    [string]$MasterPassword,
+    [System.Security.SecureString]$MasterPassword,
     [string]$StoreFile,
-    [string]$ConnectionStringSecretPath = 'ConnectionStrings:AnalyticsSQL',
-    [string]$ClientIdSecretPath = 'PBI:ClientID',
-    [string]$ClientSecretSecretPath = 'PBI:ClientSecret',
-    [string]$TenantIdSecretPath = 'PBI:TenantID',
+    [Alias('d')]
+    [switch]$DryRun,
     [ValidateSet('Trace','Debug','Information','Success','Warning','Error','Fatal')]
     [string]$LogLevel = 'Debug'
 )
@@ -16,12 +14,12 @@ $ErrorActionPreference = "Stop"
 $CapacityFilter = "('41DC39CE-E61D-4E09-A26B-2FCB5D6D8DFE','027965A4-D372-461A-862D-B0435B1A1FB0')"
 
 $SqlQueries = @{
-    AppUsersToRefresh = "SELECT * FROM PBI.APPS WHERE ID NOT IN (SELECT DISTINCT APPID FROM PBI.AppUsers WHERE InsertDateTime >= GETDATE() - 14)"
-    ReportUsersToRefresh = "SELECT DISTINCT TOP 100 ID FROM PBI.reports WHERE WorkspaceID IN (SELECT ID FROM PBI.Folders where CapacityId IN $CapacityFilter) AND ID NOT IN (SELECT ReportID FROM PBI.ReportUsers WHERE InsertDateTime >= GETDATE() - 14)"
-    GroupUsersToRefresh = "SELECT DISTINCT ID FROM PBI.Folders where CapacityId IN $CapacityFilter"
-    DatasetUsersToRefresh = "SELECT DISTINCT TOP 100 ID FROM PBI.Datasets WHERE WorkspaceID IN (SELECT ID FROM PBI.Folders where CapacityId IN $CapacityFilter) AND ID NOT IN (SELECT DISTINCT DataSetID FROM PBI.DataSetUsers WHERE InsertDateTime >= GETDATE() - 14)"
-    MaxActivityDate = "SELECT MAX(CAST(Creationtime AS DATE)) FROM PBI.ActivityEvents"
-    ProcessPBI = "EXEC PBI.SP_PROCESSPBI"
+    AppUsersToRefresh = "SELECT DISTINCT ID FROM REPORTINGSERVICES.PBI.APPS WHERE ID NOT IN (SELECT DISTINCT APPID FROM REPORTINGSERVICES.PBI.AppUsers WHERE InsertDateTime >= GETDATE() - 14)"
+    ReportUsersToRefresh = "SELECT DISTINCT TOP 100 ID FROM REPORTINGSERVICES.PBI.reports WHERE WorkspaceID IN (SELECT ID FROM REPORTINGSERVICES.PBI.Folders where CapacityId IN $CapacityFilter) AND ID NOT IN (SELECT ReportID FROM REPORTINGSERVICES.PBI.ReportUsers WHERE InsertDateTime >= GETDATE() - 14)"
+    GroupUsersToRefresh = "SELECT DISTINCT ID FROM REPORTINGSERVICES.PBI.Folders where CapacityId IN $CapacityFilter"
+    DatasetUsersToRefresh = "SELECT DISTINCT TOP 100 ID FROM REPORTINGSERVICES.PBI.Datasets WHERE WorkspaceID IN (SELECT ID FROM REPORTINGSERVICES.PBI.Folders where CapacityId IN $CapacityFilter) AND ID NOT IN (SELECT DISTINCT DataSetID FROM REPORTINGSERVICES.PBI.DataSetUsers WHERE InsertDateTime >= GETDATE() - 14)"
+    MaxActivityDate = "SELECT MAX(CAST(Creationtime AS DATE)) FROM REPORTINGSERVICES.PBI.ActivityEvents"
+    ProcessPBI = "EXEC REPORTINGSERVICES.PBI.SP_PROCESSPBI"
 }
 
 # Tables
@@ -172,6 +170,14 @@ $UserEntities = @{
 }
 
 function Get-PBIData {
+    <#
+    .SYNOPSIS
+    Retrieves data from a Power BI REST endpoint.
+
+    .DESCRIPTION
+    Calls a Power BI admin endpoint and optionally pages through results
+    using 5000-row batches, returning combined results as JSON.
+    #>
     [CmdletBinding()]
     param (
         [string]$url,
@@ -189,9 +195,19 @@ function Get-PBIData {
     $iteration = 1
     $output = New-Object System.Collections.ArrayList
 
+    # Continue requesting pages until a page returns fewer than 5000 records.
     while ($returnCount -eq 5000) {
         Write-Log "Getting data from Power BI endpoint" -Level Debug -Data @{ Url = $newURL; Iteration = $iteration; Paged = $paged }
-        $data = Invoke-PowerBIRestMethod -Url $newURL -Method Get | ConvertFrom-Json
+        try {
+            $data = Invoke-PowerBIRestMethod -Url $newURL -Method Get | ConvertFrom-Json
+        }
+        catch {
+            if (Test-IsHttp429Exception -ErrorRecord $_) {
+                Write-Log "Power BI returned HTTP 429; stopping additional querying" -Level Fatal -Data @{ Url = $newURL }
+                throw "Power BI API returned HTTP 429. Stopping additional querying."
+            }
+            throw
+        }
         if ($paged) {
             $newURL = $url + '?$top=5000&$skip=' + ($iteration * 5000)
             $returnCount = $data.value.Count
@@ -210,6 +226,14 @@ function Get-PBIData {
 }
 
 function New-Table {
+    <#
+    .SYNOPSIS
+    Converts JSON rows into a typed DataTable.
+
+    .DESCRIPTION
+    Builds a DataTable from a schema definition string and maps JSON values
+    into columns, including audit metadata used by downstream SQL loads.
+    #>
     [OutputType([System.Data.DataTable])]
     [CmdletBinding()]
     param (
@@ -225,6 +249,7 @@ function New-Table {
     foreach ($row in $data) {
         $newRow = $table.NewRow()
         foreach ($column in $table.Columns) {
+            # Normalize null/array values so SQL bulk copy can persist rows reliably.
             if ($null -eq $row.$($column.ColumnName)) {
                 $columnValue = [DBNull]::Value
             }
@@ -248,15 +273,37 @@ function New-Table {
 }
 
 function Invoke-Sql {
+    <#
+    .SYNOPSIS
+    Executes a SQL query against the analytics database.
+
+    .DESCRIPTION
+    Runs read and write SQL via Invoke-Sqlcmd and enforces DryRun behavior
+    by skipping write operations when dry-run mode is enabled.
+    #>
     param (
         [string]$Query
     )
+
+    $isWriteQuery = $Query -match '^(?is)\s*(INSERT|UPDATE|DELETE|TRUNCATE|MERGE|EXEC|CREATE|ALTER|DROP)\b'
+    if ($DryRun -and $isWriteQuery) {
+        Write-Log "DryRun enabled; skipping SQL write operation" -Level Information -Data @{ Query = $Query }
+        return @()
+    }
 
     Write-Log "Executing SQL query" -Level Debug -Data @{ Query = $Query }
     return Invoke-Sqlcmd -Query $Query -ConnectionString $connString
 }
 
 function Save-NotFoundRow {
+    <#
+    .SYNOPSIS
+    Writes a marker row for missing or empty user results.
+
+    .DESCRIPTION
+    Inserts a single metadata row into a target table to indicate either an
+    entity-not-found or no-users state for a given Power BI entity ID.
+    #>
     param (
         [string]$TableName,
         [string]$IdColumn,
@@ -265,11 +312,19 @@ function Save-NotFoundRow {
         [string]$ApiUrl
     )
 
-    $query = "INSERT INTO PBI.$TableName ($IdColumn, DisplayName, APIName, InsertDateTime, InsertBy) VALUES ('$IdValue', '$DisplayName', '$ApiUrl', GETDATE(), 'Eamonn.Watson')"
+    $query = "INSERT INTO REPORTINGSERVICES.PBI.$TableName ($IdColumn, DisplayName, APIName, InsertDateTime, InsertBy) VALUES ('$IdValue', '$DisplayName', '$ApiUrl', GETDATE(), 'PBI.PS1')"
     Invoke-Sql -Query $query
 }
 
 function Transform-JsonPayload {
+    <#
+    .SYNOPSIS
+    Applies named JSON transforms before table conversion.
+
+    .DESCRIPTION
+    Supports entity-specific transformations, such as flattening array fields
+    for dataset payloads so rows can be persisted into scalar SQL columns.
+    #>
     param (
         [string]$Name,
         [string]$Json
@@ -287,7 +342,61 @@ function Transform-JsonPayload {
     return $Json
 }
 
+function Test-IsHttp429Exception {
+    <#
+    .SYNOPSIS
+    Detects Power BI throttling errors.
+
+    .DESCRIPTION
+    Evaluates an ErrorRecord for HTTP 429 by checking response status codes
+    and fallback message text when typed response data is unavailable.
+    #>
+    param (
+        [System.Management.Automation.ErrorRecord]$ErrorRecord
+    )
+
+    if ($null -eq $ErrorRecord) {
+        return $false
+    }
+
+    $statusCode = $null
+
+    if ($ErrorRecord.Exception -and $ErrorRecord.Exception.PSObject.Properties.Name -contains 'Response') {
+        $response = $ErrorRecord.Exception.Response
+        if ($response -and $response.PSObject.Properties.Name -contains 'StatusCode') {
+            $statusCode = [int]$response.StatusCode
+        }
+    }
+
+    if ($null -eq $statusCode -and $ErrorRecord.Exception -and $ErrorRecord.Exception.InnerException -and $ErrorRecord.Exception.InnerException.PSObject.Properties.Name -contains 'Response') {
+        $innerResponse = $ErrorRecord.Exception.InnerException.Response
+        if ($innerResponse -and $innerResponse.PSObject.Properties.Name -contains 'StatusCode') {
+            $statusCode = [int]$innerResponse.StatusCode
+        }
+    }
+
+    if ($statusCode -eq 429) {
+        return $true
+    }
+
+    $message = $ErrorRecord.Exception.Message
+    if ([string]::IsNullOrWhiteSpace($message) -eq $false -and ($message -match '(?i)\b429\b|too many requests')) {
+        return $true
+    }
+
+    return $false
+}
+
 function Sync-EntityUsers {
+    <#
+    .SYNOPSIS
+    Synchronizes user access rows for Power BI entities.
+
+    .DESCRIPTION
+    Loads entity IDs from SQL, calls the related Power BI users endpoint,
+    replaces existing rows, and writes optional marker rows for empty or
+    not-found results based on configuration switches.
+    #>
     param (
         [string]$SelectQuery,
         [string]$ApiUrlTemplate,
@@ -316,10 +425,11 @@ function Sync-EntityUsers {
             $entityUsers = New-Table -tableDefinition $TableDefinition -json $api -apiURL $apiUrl
 
             foreach ($entityRow in $entityUsers) {
+                # Stamp each returned user row with the owning entity key.
                 $entityRow[$KeyColumn] = $row['id']
             }
 
-            Invoke-Sql -Query "DELETE FROM PBI.$DeleteTable WHERE $NotFoundIdColumn = '$($row.Id)'"
+            Invoke-Sql -Query "DELETE FROM REPORTINGSERVICES.PBI.$DeleteTable WHERE $NotFoundIdColumn = '$($row.Id)'"
             SaveToDatabase -data $entityUsers -table $SaveTable
             Write-Log "Saved users for entity" -Level Information -Data @{ EntityId = $row.Id; SaveTable = $SaveTable; Rows = $entityUsers.Rows.Count }
 
@@ -330,6 +440,11 @@ function Sync-EntityUsers {
         }
         catch {
             Write-Log "Error getting users for entity" -Level Error -Data @{ EntityId = $row.Id; SaveTable = $SaveTable; Message = $_.Exception.Message }
+
+            if (Test-IsHttp429Exception -ErrorRecord $_) {
+                Write-Log "Power BI returned HTTP 429 while loading entity users; stopping additional querying" -Level Fatal -Data @{ EntityId = $row.Id; SaveTable = $SaveTable }
+                throw "Power BI API returned HTTP 429. Stopping additional querying."
+            }
 
             if ($NotFoundInsertOnError) {
                 Save-NotFoundRow -TableName $NotFoundTable -IdColumn $NotFoundIdColumn -IdValue $row.Id -DisplayName $ErrorText -ApiUrl $apiUrl
@@ -345,6 +460,14 @@ function Sync-EntityUsers {
 }
 
 function Invoke-UserEntityLoad {
+    <#
+    .SYNOPSIS
+    Runs a configured user-entity synchronization.
+
+    .DESCRIPTION
+    Resolves a named entry from the user-entity configuration hashtable and
+    passes settings into the shared Sync-EntityUsers workflow.
+    #>
     param (
         [string]$Name
     )
@@ -371,6 +494,14 @@ function Invoke-UserEntityLoad {
 }
 
 function Load-AdminEntity {
+    <#
+    .SYNOPSIS
+    Loads a single admin entity into SQL.
+
+    .DESCRIPTION
+    Retrieves Power BI admin endpoint data, applies optional transforms,
+    truncates target tables when requested, then bulk loads rows to SQL.
+    #>
     param (
         [hashtable]$Config
     )
@@ -381,7 +512,7 @@ function Load-AdminEntity {
     $tableData = New-Table -tableDefinition $Config.TableDefinition -json $api -apiURL $Config.ApiUrl
 
     if ([bool]$Config.TruncateTarget) {
-        Invoke-Sql -Query "TRUNCATE TABLE PBI.$($Config.TargetTable)"
+        Invoke-Sql -Query "TRUNCATE TABLE REPORTINGSERVICES.PBI.$($Config.TargetTable)"
     }
 
     SaveToDatabase -data $tableData -table $Config.TargetTable
@@ -389,6 +520,14 @@ function Load-AdminEntity {
 }
 
 function Invoke-AdminEntityLoad {
+    <#
+    .SYNOPSIS
+    Runs a configured admin-entity load.
+
+    .DESCRIPTION
+    Resolves a named entry from the admin-entity configuration hashtable and
+    executes the load routine for that entity.
+    #>
     param (
         [string]$Name
     )
@@ -402,6 +541,14 @@ function Invoke-AdminEntityLoad {
 }
 
 function GetTable {
+    <#
+    .SYNOPSIS
+    Creates a DataTable schema from a definition string.
+
+    .DESCRIPTION
+    Parses comma-separated column definitions in the form columnName|type and
+    builds a DataTable used for staged bulk-copy operations.
+    #>
     param (
         [string]$table
     )
@@ -418,13 +565,26 @@ function GetTable {
 }
 
 function SaveToDatabase {
+    <#
+    .SYNOPSIS
+    Bulk writes DataTable content to SQL Server.
+
+    .DESCRIPTION
+    Uses SqlBulkCopy to load rows into the target REPORTINGSERVICES.PBI table
+    and honors DryRun mode by skipping the write operation.
+    #>
     param (
         [System.Data.DataTable]$data,
         [string]$table
     )
 
+    if ($DryRun) {
+        Write-Log "DryRun enabled; skipping bulk copy write" -Level Information -Data @{ DestinationTable = "PBI.$table"; Rows = $data.Rows.Count }
+        return
+    }
+
     $bulkCopy = New-Object Data.SqlClient.SqlBulkCopy($connString)
-    $bulkCopy.DestinationTableName = "PBI.$table"
+    $bulkCopy.DestinationTableName = "REPORTINGSERVICES.PBI.$table"
     $bulkCopy.BulkCopyTimeout = 900
     Write-Log "Bulk copy write starting" -Level Debug -Data @{ DestinationTable = $bulkCopy.DestinationTableName; Rows = $data.Rows.Count }
     [void]$bulkCopy.WriteToServer($data)
@@ -432,6 +592,14 @@ function SaveToDatabase {
 }
 
 function Get-Activity {
+    <#
+    .SYNOPSIS
+    Retrieves and stores activity events for a date range.
+
+    .DESCRIPTION
+    Calls Get-PowerBIActivityEvent for the provided window, converts the
+    payload into a DataTable, and saves it to ActivityEvents.
+    #>
     param (
         [string]$startDate,
         [string]$endDate
@@ -445,6 +613,14 @@ function Get-Activity {
 }
 
 function Import-File {
+    <#
+    .SYNOPSIS
+    Imports historical activity data from CSV.
+
+    .DESCRIPTION
+    Reads a CSV file containing AuditData payloads, expands each payload into
+    the activity schema, and saves the results to TEMP_ActivityEvents.
+    #>
     param (
         [string]$path
     )
@@ -455,6 +631,7 @@ function Import-File {
     $activity = GetActivityTable
 
     foreach ($row in $p) {
+        # AuditData contains embedded JSON payloads that are expanded into table rows.
         Update-Table -table $activity -json $row.AuditData
     }
 
@@ -462,31 +639,54 @@ function Import-File {
     Write-Log "Saved TEMP_ActivityEvents data" -Level Information -Data @{ Rows = $activity.Rows.Count }
 }
 
-function Get-RequiredSecret {
+function Import-LocalModule {
+    <#
+    .SYNOPSIS
+    Imports the latest local copy of a module.
+
+    .DESCRIPTION
+    Finds the highest version of a module under the configured modules root
+    and imports it explicitly from its discovered module path.
+    #>
     param (
-        [string]$Path,
-        [string]$DisplayName
+        [Parameter(Mandatory = $true)]
+        [string]$Name,
+        [Parameter(Mandatory = $true)]
+        [string]$ModulesRoot
     )
 
-    try {
-        $secret = Get-Secret -Path $Path @script:SecretStoreBoundParams
-    }
-    catch {
-        throw "Unable to load $DisplayName from SecretStore path '$Path'. $($_.Exception.Message)"
+    $availableModule = Get-Module -ListAvailable -Name $Name |
+        Where-Object { $_.ModuleBase -like "$ModulesRoot*" } |
+        Sort-Object Version -Descending |
+        Select-Object -First 1
+
+    if ($null -eq $availableModule) {
+        throw "Module '$Name' was not found under '$ModulesRoot'."
     }
 
-    if ([string]::IsNullOrWhiteSpace($secret)) {
-        throw "SecretStore value for $DisplayName at path '$Path' is empty."
-    }
-
-    return $secret.Trim()
+    Import-Module -Name $availableModule.Path -ErrorAction Stop
 }
 
-if (-not (Get-Module -ListAvailable -Name PSLogger)) {
-    throw "PSLogger module is not installed or not available in PSModulePath."
+# Probe expected module folders so this script can run from either repo root or subfolder contexts.
+$modulePathCandidates = @(
+    (Join-Path -Path $PSScriptRoot -ChildPath 'modules'),
+    (Join-Path -Path (Split-Path -Path $PSScriptRoot -Parent) -ChildPath 'modules')
+)
+
+$modulesRoot = $modulePathCandidates |
+    Where-Object { Test-Path -Path $_ -PathType Container } |
+    Select-Object -First 1
+
+if ([string]::IsNullOrWhiteSpace($modulesRoot)) {
+    throw "Local modules folder was not found. Checked: $($modulePathCandidates -join ', ')"
 }
 
-Import-Module PSLogger -ErrorAction Stop
+# Ensure local module path is searchable before importing pinned local modules.
+if (($env:PSModulePath -split ';') -notcontains $modulesRoot) {
+    $env:PSModulePath = "$modulesRoot;$env:PSModulePath"
+}
+
+Import-LocalModule -Name 'PSLogger' -ModulesRoot $modulesRoot
 
 if (-not (Get-Command -Name Write-Log -ErrorAction SilentlyContinue)) {
     throw "PSLogger module does not expose Write-Log."
@@ -497,55 +697,46 @@ if (-not (Get-Command -Name Set-LogConfiguration -ErrorAction SilentlyContinue))
 }
 
 Set-LogConfiguration -MinimumLevel $LogLevel -Console
-if (-not (Get-Module -ListAvailable -Name SecretStore)) {
-    Write-Log "SecretStore module is missing" -Level Fatal
-    throw "SecretStore module is not installed or not available in PSModulePath."
-}
+Import-LocalModule -Name 'SecretStore' -ModulesRoot $modulesRoot
 
-Import-Module SecretStore -ErrorAction Stop
-
-if (-not (Get-Command -Name Get-Secret -ErrorAction SilentlyContinue)) {
-    Write-Log "SecretStore Get-Secret command is missing" -Level Fatal
-    throw "SecretStore module does not expose Get-Secret."
-}
-
-if (-not (Get-Command -Name New-SecretStore -ErrorAction SilentlyContinue)) {
-    Write-Log "SecretStore New-SecretStore command is missing" -Level Fatal
-    throw "SecretStore module does not expose New-SecretStore."
-}
-
-if (-not (Get-Command -Name Set-Secret -ErrorAction SilentlyContinue)) {
-    Write-Log "SecretStore Set-Secret command is missing" -Level Fatal
-    throw "SecretStore module does not expose Set-Secret."
+if (-not (Get-Command -Name Get-SecretValue -ErrorAction SilentlyContinue)) {
+    Write-Log "SecretStore Get-SecretValue command is missing" -Level Fatal
+    throw "SecretStore module does not expose Get-SecretValue."
 }
 
 function Invoke-PbiExportRun {
-    Write-Log "PBI export run started" -Level Information -Data @{ LogLevel = $LogLevel }
+    <#
+    .SYNOPSIS
+    Orchestrates the full Power BI export run.
 
-    $script:SecretStoreBoundParams = @{}
+    .DESCRIPTION
+    Loads secrets, authenticates to Power BI, backfills missing activity,
+    refreshes configured entities, executes final SQL processing, and returns
+    an exit code including handled throttling status.
+    #>
+    Write-Log "PBI export run started" -Level Information -Data @{ LogLevel = $LogLevel; DryRun = [bool]$DryRun }
+
     $connectedToPowerBI = $false
+    $exitCode = 0
+    $secretStoreArgs = @{}
+
+    # Only forward optional secret-store arguments when the caller explicitly provided them.
+    if ($PSBoundParameters.ContainsKey('MasterPassword')) {
+        $secretStoreArgs['MasterPassword'] = $MasterPassword
+    }
+
+    if ($PSBoundParameters.ContainsKey('StoreFile')) {
+        $secretStoreArgs['StoreFile'] = $StoreFile
+    }
 
     try {
-        if (-not [string]::IsNullOrWhiteSpace($StoreFile)) {
-            $script:SecretStoreBoundParams['StoreFile'] = $StoreFile
-        }
 
-        $effectiveMasterPassword = $MasterPassword
-        if ([string]::IsNullOrWhiteSpace($effectiveMasterPassword)) {
-            $effectiveMasterPassword = $env:SECRETSTORE_PASSWORD
-        }
-
-        if ([string]::IsNullOrWhiteSpace($effectiveMasterPassword)) {
-            Write-Log "SecretStore password not provided" -Level Fatal
-            throw "No SecretStore password supplied. Provide -MasterPassword or set SECRETSTORE_PASSWORD."
-        }
-
-        $script:SecretStoreBoundParams['MasterPassword'] = $effectiveMasterPassword
-
-        $connString = Get-RequiredSecret -Path $ConnectionStringSecretPath -DisplayName 'SQL connection string'
-        $clientId = Get-RequiredSecret -Path $ClientIdSecretPath -DisplayName 'Power BI client ID'
-        $clientSecret = Get-RequiredSecret -Path $ClientSecretSecretPath -DisplayName 'Power BI client secret'
-        $tenantID = Get-RequiredSecret -Path $TenantIdSecretPath -DisplayName 'Power BI tenant ID'
+        # Resolve all runtime secrets required for SQL and service-principal auth.
+        $connString = Get-SecretValue @secretStoreArgs -Path 'ConnectionStrings:AnalyticsDB'
+        $clientId = Get-SecretValue @secretStoreArgs -Path 'AZURE_AD_APP:CLIENTID'
+        $clientSecret = Get-SecretValue @secretStoreArgs -Path 'AZURE_AD_APP:CLIENTSECRET'
+        $tenantID = Get-SecretValue @secretStoreArgs -Path 'AZURE_AD_APP:TENANTID'
+        
         Write-Log "Required secrets loaded from SecretStore" -Level Information
 
         $secureSecret = ConvertTo-SecureString $clientSecret -AsPlainText -Force
@@ -563,6 +754,7 @@ function Invoke-PbiExportRun {
         if ($LastDate -lt $CurrDate) {
             Write-Log "Activity gap detected; running backfill and full refresh block" -Level Information -Data @{ LastDate = $LastDate; CurrentDate = $CurrDate }
 
+            # Backfill each missing day to keep ActivityEvents complete before refreshing dimension data.
             foreach ($i in 1..($CurrDate - $LastDate).Days) {
                 $startDate = $LastDate.AddDays($i).ToString('yyyy-MM-ddT00:00:00')
                 $endDate = $LastDate.AddDays($i).ToString('yyyy-MM-ddT23:59:59')
@@ -593,12 +785,22 @@ function Invoke-PbiExportRun {
         Invoke-Sql -Query $SqlQueries.ProcessPBI
         Write-Log "Executed final processing procedure" -Level Information -Data @{ Procedure = 'PBI.SP_PROCESSPBI' }
         Write-Log "PBI export run completed" -Level Success
+        $exitCode = 0
     }
     catch {
-        Write-Log "Unhandled exception in PBI export run" -Level Fatal -Data @{ Message = $_.Exception.Message; Type = $_.Exception.GetType().FullName }
-        throw
+        # Treat 429 as a handled throttle exit so schedulers can retry without surfacing a hard failure.
+        if (Test-IsHttp429Exception -ErrorRecord $_) {
+            $exitCode = 429
+            Write-Log "Power BI API throttling encountered; run stopped gracefully" -Level Error -Data @{ ErrorCode = 'PBI429'; ExitCode = $exitCode; Message = $_.Exception.Message; Type = $_.Exception.GetType().FullName }
+            Write-Log "PBI export run completed with handled throttling failure" -Level Warning -Data @{ ErrorCode = 'PBI429'; ExitCode = $exitCode }
+        }
+        else {
+            Write-Log "Unhandled exception in PBI export run" -Level Fatal -Data @{ Message = $_.Exception.Message; Type = $_.Exception.GetType().FullName }
+            throw
+        }
     }
     finally {
+        # Safety disconnect if an exception occurs after authentication succeeds.
         if ($connectedToPowerBI) {
             try {
                 Disconnect-PowerBIServiceAccount
@@ -609,6 +811,12 @@ function Invoke-PbiExportRun {
             }
         }
     }
+
+    return $exitCode
 }
 
-Invoke-PbiExportRun
+# Return a non-zero process exit code when handled failures (like 429) occur.
+$runExitCode = Invoke-PbiExportRun
+if ($runExitCode -ne 0) {
+    exit $runExitCode
+}
