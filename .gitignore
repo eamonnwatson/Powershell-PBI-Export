@@ -35,3 +35,6 @@ Desktop.ini
 # Temporary files
 *.tmp
 ~$*
+
+.devcontainer/
+
