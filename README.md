@@ -34,19 +34,22 @@ If no activity gap is detected, the script skips step 5 and still runs steps 6 t
 | PowerShell | 5.1 (64-bit), Windows Server |
 | Module | MicrosoftPowerBIMgmt (Connect-PowerBIServiceAccount, Invoke-PowerBIRestMethod, Get-PowerBIActivityEvent) |
 | Module | SqlServer (Invoke-Sqlcmd) |
-| Module | SecretStore (Get-Secret, Set-Secret, New-SecretStore) |
-| Module | PSLogger (Write-Log, Set-LogConfiguration) |
+| Module | SecretStore (Get-Secret, Set-Secret, New-SecretStore) — see note below |
+| Module | PSLogger (Write-Log, Set-LogConfiguration) — see note below |
 | SQL access | Connection string from SecretStore (typically integrated security) |
 | Azure AD | Service principal with Power BI tenant admin API permissions |
 
-Install the required modules if not already present:
+Install the publicly available modules if not already present:
 
 ```powershell
 Install-Module -Name MicrosoftPowerBIMgmt -Scope CurrentUser
 Install-Module -Name SqlServer -Scope CurrentUser
-Install-Module -Name SecretStore -Scope CurrentUser
-Install-Module -Name PSLogger -Scope CurrentUser
 ```
+
+> **Note:** SecretStore and PSLogger are custom modules authored by [Eamonn Watson](https://github.com/eamonnwatson) and are **not** available on the PowerShell Gallery. Clone or download them from GitHub before running the script:
+>
+> - SecretStore: https://github.com/eamonnwatson/SecretStore
+> - PSLogger: https://github.com/eamonnwatson/PSLogger
 
 ## Configuration
 
@@ -65,16 +68,11 @@ Default secret paths used by the script:
 - PBI:ClientSecret (Azure AD client secret)
 - PBI:TenantID (Azure AD tenant ID)
 
-You can bootstrap secrets using the sample in secrets.example.ps1.
-
 ### Script parameters
 
 - -MasterPassword: SecretStore master password. If omitted, SECRETSTORE_PASSWORD is used.
 - -StoreFile: Optional explicit SecretStore file path.
-- -ConnectionStringSecretPath: Overrides ConnectionStrings:AnalyticsSQL.
-- -ClientIdSecretPath: Overrides PBI:ClientID.
-- -ClientSecretSecretPath: Overrides PBI:ClientSecret.
-- -TenantIdSecretPath: Overrides PBI:TenantID.
+- -DryRun: Skips all SQL write operations (reads still execute). Useful for testing.
 - -LogLevel: PSLogger minimum level. Allowed values are Trace, Debug, Information, Success, Warning, Error, Fatal. Default is Debug.
 
 ## Hard-coded scope filter
@@ -126,8 +124,11 @@ powershell.exe -ExecutionPolicy Bypass -File ".\PBI.ps1"
 # Run with explicit SecretStore password
 powershell.exe -ExecutionPolicy Bypass -File ".\PBI.ps1" -MasterPassword "your-master-password"
 
-# Run with custom SecretStore file and path overrides
-powershell.exe -ExecutionPolicy Bypass -File ".\PBI.ps1" -StoreFile "D:\Secrets\pbi.store" -ConnectionStringSecretPath "ConnectionStrings:ReportingSQL"
+# Run with a custom SecretStore file
+powershell.exe -ExecutionPolicy Bypass -File ".\PBI.ps1" -StoreFile "D:\Secrets\pbi.store"
+
+# Run in dry-run mode (no SQL writes)
+powershell.exe -ExecutionPolicy Bypass -File ".\PBI.ps1" -DryRun
 
 # Run with quieter logging
 powershell.exe -ExecutionPolicy Bypass -File ".\PBI.ps1" -LogLevel Information
