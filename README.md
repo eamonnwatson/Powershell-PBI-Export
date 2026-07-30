@@ -1,104 +1,136 @@
 # PBI Export
 
-PowerShell script that pulls Power BI tenant metadata and activity logs via the Power BI Admin REST API and bulk-loads the results into a SQL Server database.
+PowerShell 5.1 script that pulls Power BI tenant metadata and activity logs via the Power BI Admin REST API and bulk-loads the results into SQL Server.
 
 ## What it does
 
 On each run the script:
 
-1. Connects to Power BI as a Service Principal.
-2. Checks the most recent activity date stored in `PBI.ActivityEvents` and backfills missing days up to yesterday.
-3. If any activity backfill was performed, it also refreshes all entity tables:
-   - Workspaces/Groups → `PBI.Folders_Staging`
-   - Apps → `PBI.Apps`
-   - Reports → `PBI.Reports`
-   - Datasets → `PBI.Datasets`
-   - Capacity refresh schedules → `PBI.RefreshSchedule_Staging`
-   - Capacities → `PBI.Capacities`
-   - App users → `PBI.AppUsers`
-4. Regardless of backfill, refreshes incremental user-access tables:
-   - Report users → `PBI.ReportUsers` (top 100 reports not updated in 14 days, filtered to named capacities)
-   - Workspace users → `PBI.FolderUsers` (filtered to named capacities)
-   - Dataset users → `PBI.DatasetUsers` (top 100 datasets not updated in 14 days, filtered to named capacities)
-5. Disconnects from Power BI.
-6. Executes `EXEC PBI.SP_PROCESSPBI` to process the staged data.
+1. Loads required secrets from SecretStore (SQL connection string, client ID, client secret, tenant ID).
+2. Connects to Power BI as a service principal.
+3. Reads the latest date in PBI.ActivityEvents and compares it to yesterday.
+4. If there is a gap, backfills each missing day of activity events.
+5. If a gap was backfilled, also runs the full admin refresh block:
+   - Workspaces/Groups -> PBI.Folders_Staging
+   - Apps -> PBI.Apps
+   - Reports -> PBI.Reports
+   - Datasets -> PBI.Datasets
+   - Capacity refresh schedules -> PBI.RefreshSchedule_Staging
+   - Capacities -> PBI.Capacities
+   - App users -> PBI.AppUsers
+6. Always runs incremental user-access refreshes:
+   - Report users -> PBI.ReportUsers (top 100 stale reports, scoped to configured capacities)
+   - Workspace users -> PBI.FolderUsers (all workspaces in configured capacities)
+   - Dataset users -> PBI.DatasetUsers (top 100 stale datasets, scoped to configured capacities)
+7. Disconnects from Power BI.
+8. Executes PBI.SP_PROCESSPBI.
+
+If no activity gap is detected, the script skips step 5 and still runs steps 6 to 8.
 
 ## Prerequisites
 
 | Requirement | Details |
 |-------------|---------|
 | PowerShell | 5.1 (64-bit), Windows Server |
-| Module | `MicrosoftPowerBIMgmt` (`Connect-PowerBIServiceAccount`, `Invoke-PowerBIRestMethod`, `Get-PowerBIActivityEvent`) |
-| Module | `SqlServer` (`Invoke-Sqlcmd`) |
-| SQL access | Windows Integrated Security to `SQL Server` |
-| Azure AD | Service Principal with Power BI tenant admin API permissions |
+| Module | MicrosoftPowerBIMgmt (Connect-PowerBIServiceAccount, Invoke-PowerBIRestMethod, Get-PowerBIActivityEvent) |
+| Module | SqlServer (Invoke-Sqlcmd) |
+| Module | SecretStore (Get-Secret, Set-Secret, New-SecretStore) |
+| Module | PSLogger (Write-Log, Set-LogConfiguration) |
+| SQL access | Connection string from SecretStore (typically integrated security) |
+| Azure AD | Service principal with Power BI tenant admin API permissions |
 
 Install the required modules if not already present:
 
 ```powershell
 Install-Module -Name MicrosoftPowerBIMgmt -Scope CurrentUser
 Install-Module -Name SqlServer -Scope CurrentUser
+Install-Module -Name SecretStore -Scope CurrentUser
+Install-Module -Name PSLogger -Scope CurrentUser
 ```
 
 ## Configuration
 
-Credentials and connection details are stored in `secrets.ps1`, which is excluded from source control. Copy `secrets.example.ps1` to `secrets.ps1` and fill in the real values:
+Credentials and connection details are loaded from SecretStore.
+
+Set the SecretStore password for the current session:
 
 ```powershell
-Copy-Item secrets.example.ps1 secrets.ps1
+$env:SECRETSTORE_PASSWORD = 'your-master-password'
 ```
 
-`secrets.ps1` must define:
+Default secret paths used by the script:
 
-- **`$clientId` / `$clientSecret` / `$tenantID`** - Azure AD Service Principal credentials.
-- **`$connString`** - SQL Server connection string (uses Windows Integrated Security by default).
+- ConnectionStrings:AnalyticsSQL (SQL connection string)
+- PBI:ClientID (Azure AD client ID)
+- PBI:ClientSecret (Azure AD client secret)
+- PBI:TenantID (Azure AD tenant ID)
 
-One additional value is hard-coded in the script itself:
+You can bootstrap secrets using the sample in secrets.example.ps1.
 
-- **Capacity GUIDs** - Two capacity IDs are hard-coded in the user-access queries to scope which workspaces/reports/datasets are processed.
+### Script parameters
+
+- -MasterPassword: SecretStore master password. If omitted, SECRETSTORE_PASSWORD is used.
+- -StoreFile: Optional explicit SecretStore file path.
+- -ConnectionStringSecretPath: Overrides ConnectionStrings:AnalyticsSQL.
+- -ClientIdSecretPath: Overrides PBI:ClientID.
+- -ClientSecretSecretPath: Overrides PBI:ClientSecret.
+- -TenantIdSecretPath: Overrides PBI:TenantID.
+- -LogLevel: PSLogger minimum level. Allowed values are Trace, Debug, Information, Success, Warning, Error, Fatal. Default is Debug.
+
+## Hard-coded scope filter
+
+User-access refresh queries are restricted to two hard-coded capacity GUIDs via a script constant. Update the CapacityFilter variable in PBI.ps1 when this scope changes.
 
 ## Key functions
 
 | Function | Purpose |
 |----------|---------|
-| `Get-PBIData` | Calls a Power BI Admin REST endpoint, handling pagination in batches of 5,000 records. |
-| `New-Table` | Converts a JSON API response into a typed `DataTable` using a column-definition string. |
-| `GetTable` | Parses a `name\|type,...` column definition string into a `DataTable` schema. |
-| `SaveToDatabase` | Bulk-copies a `DataTable` to a `PBI.<table>` target using `SqlBulkCopy`. |
-| `Get-Groups` | Fetches all workspaces. |
-| `Get-Apps` | Fetches all apps (truncates target before load). |
-| `Get-Reports` | Fetches all reports (truncates target before load). |
-| `Get-Datasets` | Fetches all datasets (truncates target before load). |
-| `Get-Refresh` | Fetches capacity refreshable schedule data. |
-| `Get-Capacity` | Fetches all capacities (truncates target before load). |
-| `Get-Activity` | Fetches activity events for a single day window. |
-| `Get-AppUsers` | Incrementally refreshes user access per app (skips apps updated in last 14 days). |
-| `Get-ReportUsers` | Incrementally refreshes user access per report (scoped to named capacities). |
-| `Get-GroupUsers` | Refreshes user access per workspace (scoped to named capacities). |
-| `Get-DatasetUsers` | Incrementally refreshes user access per dataset (scoped to named capacities). |
-| `Import-File` | Utility to import activity events from a CSV file into `PBI.TEMP_ActivityEvents`. |
+| Invoke-PbiExportRun | Main orchestration and error handling for the full run. |
+| Get-PBIData | Calls a Power BI Admin REST endpoint and handles 5,000-row paging where applicable. |
+| Load-AdminEntity / Invoke-AdminEntityLoad | Config-driven admin entity loads, including optional table truncation. |
+| Sync-EntityUsers / Invoke-UserEntityLoad | Config-driven user-access loads with per-entity delete+reload behavior. |
+| Transform-JsonPayload | Applies payload transforms (currently flattens dataset array fields). |
+| Get-Activity | Loads one day of activity events into PBI.ActivityEvents. |
+| New-Table / GetTable | Builds typed DataTable objects from API payloads and column definitions. |
+| SaveToDatabase | Writes DataTable content to SQL via SqlBulkCopy. |
+| Get-RequiredSecret | Retrieves and validates required SecretStore values. |
+| Import-File | Helper to import CSV activity data into PBI.TEMP_ActivityEvents. |
 
-## Database schema (PBI schema)
+## Database targets and load strategy
 
 | Table | Load strategy |
 |-------|--------------|
-| `ActivityEvents` | Incremental append by date |
-| `Folders_Staging` | Full replace (processed by stored procedure) |
-| `Apps` | Truncate and reload |
-| `Reports` | Truncate and reload |
-| `Datasets` | Truncate and reload |
-| `RefreshSchedule_Staging` | Full replace (processed by stored procedure) |
-| `Capacities` | Truncate and reload |
-| `AppUsers` | Delete per app + reload (14-day incremental) |
-| `ReportUsers` | Delete per report + reload (14-day incremental) |
-| `FolderUsers` | Delete per folder + reload |
-| `DatasetUsers` | Delete per dataset + reload (14-day incremental) |
+| ActivityEvents | Incremental append by date |
+| Folders_Staging | Reloaded during full refresh block |
+| Apps | Truncate and reload during full refresh block |
+| Reports | Truncate and reload during full refresh block |
+| Datasets | Truncate and reload during full refresh block |
+| RefreshSchedule_Staging | Reloaded during full refresh block |
+| Capacities | Truncate and reload during full refresh block |
+| AppUsers | Delete per app plus reload (14-day stale app selection) during full refresh block |
+| ReportUsers | Delete per report plus reload (14-day stale report selection, top 100), every run |
+| FolderUsers | Delete per folder plus reload (capacity-filtered), every run |
+| DatasetUsers | Delete per dataset plus reload (14-day stale dataset selection, top 100), every run |
+
+Notes:
+
+- ReportUsers and FolderUsers insert marker rows when no users are found or when the target entity is not found.
+- DatasetUsers inserts marker rows when no users are found.
 
 ## Running the script
 
 ```powershell
-# Run directly (SQL auth uses Windows Integrated Security automatically)
+# Run with SECRETSTORE_PASSWORD already set
 powershell.exe -ExecutionPolicy Bypass -File ".\PBI.ps1"
+
+# Run with explicit SecretStore password
+powershell.exe -ExecutionPolicy Bypass -File ".\PBI.ps1" -MasterPassword "your-master-password"
+
+# Run with custom SecretStore file and path overrides
+powershell.exe -ExecutionPolicy Bypass -File ".\PBI.ps1" -StoreFile "D:\Secrets\pbi.store" -ConnectionStringSecretPath "ConnectionStrings:ReportingSQL"
+
+# Run with quieter logging
+powershell.exe -ExecutionPolicy Bypass -File ".\PBI.ps1" -LogLevel Information
 ```
 
-The script is intended to be scheduled daily (e.g. via SQL Server Agent or Windows Task Scheduler) after midnight so that the previous day's activity events are available.
+The script is intended to be scheduled daily (for example from SQL Server Agent or Windows Task Scheduler) shortly after midnight so the prior day activity window is available.
