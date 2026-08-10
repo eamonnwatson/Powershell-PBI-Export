@@ -454,7 +454,9 @@ function Sync-EntityUsers {
             }
         }
         catch {
-            Write-Log "Error getting users for entity" -Level Error -Data @{ EntityId = $row.Id; SaveTable = $SaveTable; Message = $_.Exception.Message }
+            if ($_.Exception.Message -notlike '*PowerBIEntityNotFound*') {
+                Write-Log "Error getting users for entity" -Level Error -Data @{ EntityId = $row.Id; SaveTable = $SaveTable; Message = $_.Exception.Message }
+            }
 
             if (Test-IsHttp429Exception -ErrorRecord $_) {
                 Write-Log "Power BI returned HTTP 429 while loading entity users; stopping additional querying" -Level Fatal -Data @{ EntityId = $row.Id; SaveTable = $SaveTable }
