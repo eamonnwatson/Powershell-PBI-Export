@@ -722,12 +722,12 @@ function Invoke-PbiExportRun {
     $exitCode = 0
     $secretStoreArgs = @{}
 
-    # Only forward optional secret-store arguments when the caller explicitly provided them.
-    if ($PSBoundParameters.ContainsKey('MasterPassword')) {
+    # Only forward optional secret-store arguments when the script was launched with them.
+    if ($MasterPassword) {
         $secretStoreArgs['MasterPassword'] = $MasterPassword
     }
 
-    if ($PSBoundParameters.ContainsKey('SecretFile')) {
+    if ($SecretFile) {
         $secretStoreArgs['StoreFile'] = $SecretFile
     }
 
