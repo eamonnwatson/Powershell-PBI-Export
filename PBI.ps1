@@ -22,7 +22,7 @@ param(
     [string]$ConnectionStringName,
 
     [ValidateSet('Trace','Debug','Information','Success','Warning','Error','Fatal')]
-    [string]$LogLevel = 'Warning'
+    [string]$LogLevel = 'Information'
 )
 
 $ErrorActionPreference = "Stop"
@@ -30,9 +30,9 @@ $CapacityFilter = "('41DC39CE-E61D-4E09-A26B-2FCB5D6D8DFE','027965A4-D372-461A-8
 
 $SqlQueries = @{
     AppUsersToRefresh = "SELECT DISTINCT ID FROM REPORTINGSERVICES.PBI.APPS WHERE ID NOT IN (SELECT DISTINCT APPID FROM REPORTINGSERVICES.PBI.AppUsers WHERE InsertDateTime >= GETDATE() - 14)"
-    ReportUsersToRefresh = "SELECT DISTINCT TOP 100 ID FROM REPORTINGSERVICES.PBI.reports WHERE WorkspaceID IN (SELECT ID FROM REPORTINGSERVICES.PBI.Folders where CapacityId IN $CapacityFilter) AND ID NOT IN (SELECT ReportID FROM REPORTINGSERVICES.PBI.ReportUsers WHERE InsertDateTime >= GETDATE() - 14)"
-    GroupUsersToRefresh = "SELECT DISTINCT ID FROM REPORTINGSERVICES.PBI.Folders where CapacityId IN $CapacityFilter"
-    DatasetUsersToRefresh = "SELECT DISTINCT TOP 100 ID FROM REPORTINGSERVICES.PBI.Datasets WHERE WorkspaceID IN (SELECT ID FROM REPORTINGSERVICES.PBI.Folders where CapacityId IN $CapacityFilter) AND ID NOT IN (SELECT DISTINCT DataSetID FROM REPORTINGSERVICES.PBI.DataSetUsers WHERE InsertDateTime >= GETDATE() - 14)"
+    ReportUsersToRefresh = "SELECT DISTINCT TOP 50 ID FROM REPORTINGSERVICES.PBI.reports WHERE WorkspaceID IN (SELECT ID FROM REPORTINGSERVICES.PBI.Folders where CapacityId IN $CapacityFilter) AND ID NOT IN (SELECT ReportID FROM REPORTINGSERVICES.PBI.ReportUsers WHERE InsertDateTime >= GETDATE() - 14)"
+    GroupUsersToRefresh = "SELECT DISTINCT TOP 50 ID FROM REPORTINGSERVICES.PBI.Folders WHERE IsCurrent = 1 AND CapacityId IN $CapacityFilter AND InsertDateTime >= GETDATE() - 14"
+    DatasetUsersToRefresh = "SELECT DISTINCT TOP 50 ID FROM REPORTINGSERVICES.PBI.Datasets WHERE WorkspaceID IN (SELECT ID FROM REPORTINGSERVICES.PBI.Folders where CapacityId IN $CapacityFilter) AND ID NOT IN (SELECT DISTINCT DataSetID FROM REPORTINGSERVICES.PBI.DataSetUsers WHERE InsertDateTime >= GETDATE() - 14)"
     MaxActivityDate = "SELECT MAX(CAST(Creationtime AS DATE)) FROM REPORTINGSERVICES.PBI.ActivityEvents"
     ProcessPBI = "EXEC REPORTINGSERVICES.PBI.SP_PROCESSPBI"
 }
