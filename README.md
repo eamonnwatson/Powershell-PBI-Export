@@ -1,137 +1,250 @@
-# PBI Export
+# Power BI Admin Export to SQL Server
 
-PowerShell 5.1 script that pulls Power BI tenant metadata and activity logs via the Power BI Admin REST API and bulk-loads the results into SQL Server.
+This script collects Power BI tenant admin metadata and activity events, then loads the results into SQL Server tables under REPORTINGSERVICES.PBI.
 
-## What it does
+It is designed for PowerShell 5.1 on Windows Server and uses local helper modules for logging and secret retrieval.
 
-On each run the script:
+## What the script does
 
-1. Loads required secrets from SecretStore (SQL connection string, client ID, client secret, tenant ID).
-2. Connects to Power BI as a service principal.
-3. Reads the latest date in PBI.ActivityEvents and compares it to yesterday.
-4. If there is a gap, backfills each missing day of activity events.
-5. If a gap was backfilled, also runs the full admin refresh block:
-   - Workspaces/Groups -> PBI.Folders_Staging
-   - Apps -> PBI.Apps
-   - Reports -> PBI.Reports
-   - Datasets -> PBI.Datasets
-   - Capacity refresh schedules -> PBI.RefreshSchedule_Staging
-   - Capacities -> PBI.Capacities
-   - App users -> PBI.AppUsers
-6. Always runs incremental user-access refreshes:
-   - Report users -> PBI.ReportUsers (top 100 stale reports, scoped to configured capacities)
-   - Workspace users -> PBI.FolderUsers (all workspaces in configured capacities)
-   - Dataset users -> PBI.DatasetUsers (top 100 stale datasets, scoped to configured capacities)
-7. Disconnects from Power BI.
-8. Executes PBI.SP_PROCESSPBI.
+The script runs as a six-phase pipeline:
 
-If no activity gap is detected, the script skips step 5 and still runs steps 6 to 8.
+1. Local module bootstrap and logging setup
+2. SecretStore and authentication setup
+3. Activity gap check and optional day-by-day backfill
+4. Conditional full admin refresh block
+5. Incremental user access refresh block
+6. Final SQL processing and exit code handling
+
+Key behaviors:
+
+- Connects to Power BI using a service principal.
+- Checks the latest date in REPORTINGSERVICES.PBI.ActivityEvents against yesterday.
+- Backfills each missing day using Get-PowerBIActivityEvent when a gap exists.
+- Loads admin entities through config-driven endpoint definitions.
+- Refreshes ReportUsers, GroupUsers, and DatasetUsers every run.
+- Stops querying immediately when Power BI returns HTTP 429 and exits with code 429.
+- Supports dry-run mode that skips all SQL write operations while still running API calls and SQL reads.
 
 ## Prerequisites
 
-| Requirement | Details |
-|-------------|---------|
-| PowerShell | 5.1 (64-bit), Windows Server |
-| Module | MicrosoftPowerBIMgmt (Connect-PowerBIServiceAccount, Invoke-PowerBIRestMethod, Get-PowerBIActivityEvent) |
-| Module | SqlServer (Invoke-Sqlcmd) |
-| Module | SecretStore (Get-Secret, Set-Secret, New-SecretStore) — see note below |
-| Module | PSLogger (Write-Log, Set-LogConfiguration) — see note below |
-| SQL access | Connection string from SecretStore (typically integrated security) |
-| Azure AD | Service principal with Power BI tenant admin API permissions |
+- Windows host running PowerShell 5.1 (64-bit).
+- Access to Power BI Admin APIs using a service principal.
+- SQL Server connectivity for REPORTINGSERVICES.PBI tables and stored procedures.
+- Public modules installed:
+   - MicrosoftPowerBIMgmt
+   - SqlServer
+- Local modules folder containing:
+   - PSLogger
+   - SecretStore
 
-Install the publicly available modules if not already present:
+Install public modules if needed:
 
 ```powershell
 Install-Module -Name MicrosoftPowerBIMgmt -Scope CurrentUser
 Install-Module -Name SqlServer -Scope CurrentUser
 ```
 
-> **Note:** SecretStore and PSLogger are custom modules authored by [Eamonn Watson](https://github.com/eamonnwatson) and are **not** available on the PowerShell Gallery. Clone or download them from GitHub before running the script:
->
-> - SecretStore: https://github.com/eamonnwatson/SecretStore
-> - PSLogger: https://github.com/eamonnwatson/PSLogger
+The script probes for local modules under one of these locations:
 
-## Configuration
+- .\modules
+- ..\modules
 
-Credentials and connection details are loaded from SecretStore.
+## Required parameters
 
-Set the SecretStore password for the current session:
+- ConnectionStringName: SecretStore key name under ConnectionStrings: used to get the SQL connection string.
 
-```powershell
-$env:SECRETSTORE_PASSWORD = 'your-master-password'
-```
+Optional parameters:
 
-Default secret paths used by the script:
+- -f or -SecretFile: SecretStore file path.
+- -p or -MasterPassword: SecretStore master password as SecureString.
+- -d or -DryRun: run all read and API steps, but skip SQL writes.
+- -LogLevel: Trace, Debug, Information, Success, Warning, Error, Fatal.
 
-- ConnectionStrings:AnalyticsSQL (SQL connection string)
-- PBI:ClientID (Azure AD client ID)
-- PBI:ClientSecret (Azure AD client secret)
-- PBI:TenantID (Azure AD tenant ID)
+Default log level is Warning.
 
-### Script parameters
+## Runtime configuration defaults
 
-- -MasterPassword: SecretStore master password. If omitted, SECRETSTORE_PASSWORD is used.
-- -StoreFile: Optional explicit SecretStore file path.
-- -DryRun: Skips all SQL write operations (reads still execute). Useful for testing.
-- -LogLevel: PSLogger minimum level. Allowed values are Trace, Debug, Information, Success, Warning, Error, Fatal. Default is Debug.
+The script includes top-level defaults and config maps:
 
-## Hard-coded scope filter
+- ErrorActionPreference = Stop
+- CapacityFilter contains two hard-coded capacity GUIDs
+- SqlQueries map defines select and process statements
+- AdminEntities map defines endpoint URLs, paging mode, and SQL targets
+- UserEntities map defines select queries, user endpoints, and marker-row behavior
 
-User-access refresh queries are restricted to two hard-coded capacity GUIDs via a script constant. Update the CapacityFilter variable in PBI.ps1 when this scope changes.
+Endpoint paging default:
 
-## Key functions
+- Paged admin endpoints use top = 5000 with skip iteration.
 
-| Function | Purpose |
-|----------|---------|
-| Invoke-PbiExportRun | Main orchestration and error handling for the full run. |
-| Get-PBIData | Calls a Power BI Admin REST endpoint and handles 5,000-row paging where applicable. |
-| Load-AdminEntity / Invoke-AdminEntityLoad | Config-driven admin entity loads, including optional table truncation. |
-| Sync-EntityUsers / Invoke-UserEntityLoad | Config-driven user-access loads with per-entity delete+reload behavior. |
-| Transform-JsonPayload | Applies payload transforms (currently flattens dataset array fields). |
-| Get-Activity | Loads one day of activity events into PBI.ActivityEvents. |
-| New-Table / GetTable | Builds typed DataTable objects from API payloads and column definitions. |
-| SaveToDatabase | Writes DataTable content to SQL via SqlBulkCopy. |
-| Get-RequiredSecret | Retrieves and validates required SecretStore values. |
-| Import-File | Helper to import CSV activity data into PBI.TEMP_ActivityEvents. |
+## SecretStore keys used
 
-## Database targets and load strategy
+The script resolves these required key paths from SecretStore:
 
-| Table | Load strategy |
-|-------|--------------|
-| ActivityEvents | Incremental append by date |
-| Folders_Staging | Reloaded during full refresh block |
-| Apps | Truncate and reload during full refresh block |
-| Reports | Truncate and reload during full refresh block |
-| Datasets | Truncate and reload during full refresh block |
-| RefreshSchedule_Staging | Reloaded during full refresh block |
-| Capacities | Truncate and reload during full refresh block |
-| AppUsers | Delete per app plus reload (14-day stale app selection) during full refresh block |
-| ReportUsers | Delete per report plus reload (14-day stale report selection, top 100), every run |
-| FolderUsers | Delete per folder plus reload (capacity-filtered), every run |
-| DatasetUsers | Delete per dataset plus reload (14-day stale dataset selection, top 100), every run |
+- ConnectionStrings:{ConnectionStringName}
+- AZURE_AD_APP:CLIENTID
+- AZURE_AD_APP:CLIENTSECRET
+- AZURE_AD_APP:TENANTID
 
-Notes:
+## Quick start
 
-- ReportUsers and FolderUsers insert marker rows when no users are found or when the target entity is not found.
-- DatasetUsers inserts marker rows when no users are found.
-
-## Running the script
+Run a normal export:
 
 ```powershell
-# Run with SECRETSTORE_PASSWORD already set
-powershell.exe -ExecutionPolicy Bypass -File ".\PBI.ps1"
-
-# Run with explicit SecretStore password
-powershell.exe -ExecutionPolicy Bypass -File ".\PBI.ps1" -MasterPassword "your-master-password"
-
-# Run with a custom SecretStore file
-powershell.exe -ExecutionPolicy Bypass -File ".\PBI.ps1" -StoreFile "D:\Secrets\pbi.store"
-
-# Run in dry-run mode (no SQL writes)
-powershell.exe -ExecutionPolicy Bypass -File ".\PBI.ps1" -DryRun
-
-# Run with quieter logging
-powershell.exe -ExecutionPolicy Bypass -File ".\PBI.ps1" -LogLevel Information
+.\PBI.ps1 -ConnectionStringName AnalyticsSQL
 ```
 
-The script is intended to be scheduled daily (for example from SQL Server Agent or Windows Task Scheduler) shortly after midnight so the prior day activity window is available.
+Run with explicit SecretStore file and master password:
+
+```powershell
+$pw = Read-Host 'Secret store master password' -AsSecureString
+
+.\PBI.ps1 `
+   -ConnectionStringName AnalyticsSQL `
+   -SecretFile C:\Secrets\pbi.store `
+   -MasterPassword $pw
+```
+
+Run in dry-run mode:
+
+```powershell
+.\PBI.ps1 -ConnectionStringName AnalyticsSQL -DryRun
+```
+
+Run with more verbose logging:
+
+```powershell
+.\PBI.ps1 -ConnectionStringName AnalyticsSQL -LogLevel Information
+```
+
+In dry-run mode:
+
+- SQL read queries still run.
+- Power BI API calls still run.
+- SQL write actions are skipped, including DELETE, TRUNCATE, EXEC, INSERT, and bulk copy writes.
+
+## Phase details
+
+### Phase A: Module bootstrap and logger setup
+
+- Resolves modules root from .\modules or ..\modules.
+- Adds modules root to PSModulePath if needed.
+- Imports PSLogger and SecretStore from the local modules folder.
+- Initializes console logging with the selected log level.
+
+### Phase B: Secret load and Power BI sign-in
+
+- Reads required secrets from SecretStore.
+- Builds PSCredential from CLIENTID and CLIENTSECRET.
+- Connects with Connect-PowerBIServiceAccount using service principal auth.
+
+### Phase C: Activity gap detection and backfill
+
+- Reads max activity date from REPORTINGSERVICES.PBI.ActivityEvents.
+- Compares it to yesterday.
+- If max date is behind, loads each missing day using:
+   - StartDateTime: yyyy-MM-ddT00:00:00
+   - EndDateTime: yyyy-MM-ddT23:59:59
+- Writes results into REPORTINGSERVICES.PBI.ActivityEvents.
+
+### Phase D: Full admin refresh block (only when a gap exists)
+
+Runs these entity loads:
+
+- Reports -> REPORTINGSERVICES.PBI.Reports (truncate + reload)
+- Groups -> REPORTINGSERVICES.PBI.Folders_Staging (reload)
+- Apps -> REPORTINGSERVICES.PBI.Apps (truncate + reload)
+- Datasets -> REPORTINGSERVICES.PBI.Datasets (truncate + reload)
+- Refresh -> REPORTINGSERVICES.PBI.RefreshSchedule_Staging (reload)
+- Capacity -> REPORTINGSERVICES.PBI.Capacities (truncate + reload)
+- AppUsers -> REPORTINGSERVICES.PBI.AppUsers (per-app delete + reload for stale apps)
+
+Entity paging behavior:
+
+- Paged endpoints request 5000 rows per call with top/skip pagination.
+- Capacities endpoint is not paged.
+
+### Phase E: Incremental user access refresh (every run)
+
+Runs these syncs every execution:
+
+- ReportUsers -> REPORTINGSERVICES.PBI.ReportUsers
+- GroupUsers -> REPORTINGSERVICES.PBI.FolderUsers
+- DatasetUsers -> REPORTINGSERVICES.PBI.DatasetUsers
+
+Selection scope and behavior:
+
+- ReportUsers and DatasetUsers use top 100 stale IDs from SQL.
+- GroupUsers uses all workspace IDs in the configured capacity filter.
+- Existing rows for each entity ID are deleted before reinsert.
+- Marker rows are written for configured no-users and not-found scenarios.
+
+### Phase F: Final processing and exit behavior
+
+- Disconnects from Power BI.
+- Executes REPORTINGSERVICES.PBI.SP_PROCESSPBI.
+- Returns process exit code:
+   - 0 on success
+   - 429 when throttling is detected and handled
+
+Handled throttling behavior:
+
+- HTTP 429 is treated as a scheduler-friendly handled failure.
+- The script logs the throttle event and exits with code 429.
+
+## API endpoints used
+
+- https://api.powerbi.com/v1.0/myorg/admin/groups
+- https://api.powerbi.com/v1.0/myorg/admin/apps
+- https://api.powerbi.com/v1.0/myorg/admin/reports
+- https://api.powerbi.com/v1.0/myorg/admin/datasets
+- https://api.powerbi.com/v1.0/myorg/admin/capacities/refreshables
+- https://api.powerbi.com/v1.0/myorg/admin/capacities
+- https://api.powerbi.com/v1.0/myorg/admin/apps/{id}/users
+- https://api.powerbi.com/v1.0/myorg/admin/reports/{id}/users
+- https://api.powerbi.com/v1.0/myorg/admin/groups/{id}/users
+- https://api.powerbi.com/v1.0/myorg/admin/datasets/{id}/users
+- https://api.powerbi.com/v1.0/myorg/admin/activityevents
+
+## SQL objects touched
+
+Primary load targets:
+
+- REPORTINGSERVICES.PBI.ActivityEvents
+- REPORTINGSERVICES.PBI.Folders_Staging
+- REPORTINGSERVICES.PBI.Apps
+- REPORTINGSERVICES.PBI.Reports
+- REPORTINGSERVICES.PBI.Datasets
+- REPORTINGSERVICES.PBI.RefreshSchedule_Staging
+- REPORTINGSERVICES.PBI.Capacities
+- REPORTINGSERVICES.PBI.AppUsers
+- REPORTINGSERVICES.PBI.ReportUsers
+- REPORTINGSERVICES.PBI.FolderUsers
+- REPORTINGSERVICES.PBI.DatasetUsers
+
+Final processing command:
+
+- EXEC REPORTINGSERVICES.PBI.SP_PROCESSPBI
+
+## Capacity filter scope
+
+Some user refresh SQL queries are scoped to two hard-coded capacity IDs in the script:
+
+- 41DC39CE-E61D-4E09-A26B-2FCB5D6D8DFE
+- 027965A4-D372-461A-862D-B0435B1A1FB0
+
+If tenant scope changes, update the CapacityFilter constant in the script.
+
+## Operational notes
+
+- This script is intended to run daily after midnight so the previous day activity window is complete.
+- Script files should remain ASCII-only for PowerShell 5.1 compatibility.
+- HTTP 429 is treated as a handled scheduler-friendly failure with exit code 429.
+
+## Troubleshooting checklist
+
+1. Verify local modules folder exists and contains PSLogger and SecretStore.
+2. Verify MicrosoftPowerBIMgmt and SqlServer modules are installed.
+3. Verify SecretStore contains all required keys listed above.
+4. Verify service principal has required Power BI admin API permissions.
+5. Verify SQL login and connection string resolve to the expected REPORTINGSERVICES database.
+6. Use -LogLevel Debug to increase diagnostic output.
