@@ -2,12 +2,27 @@
 
 [CmdletBinding()]
 param(
+    [Parameter(Mandatory = $false)]
+    [Alias('f')]
+    [ValidateNotNullOrEmpty()]
+    [string]$SecretFile,
+
+    [Parameter(Mandatory = $false)]
+    [Alias('p')]
+    [ValidateNotNullOrEmpty()]
     [System.Security.SecureString]$MasterPassword,
-    [string]$StoreFile,
+ 
+    [Parameter(Mandatory = $false)]
     [Alias('d')]
     [switch]$DryRun,
+
+    [Parameter(Mandatory = $true)]
+    [Alias('c')]
+    [ValidateNotNullOrEmpty()]
+    [string]$ConnectionStringName,
+
     [ValidateSet('Trace','Debug','Information','Success','Warning','Error','Fatal')]
-    [string]$LogLevel = 'Debug'
+    [string]$LogLevel = 'Warning'
 )
 
 $ErrorActionPreference = "Stop"
@@ -639,15 +654,11 @@ function Import-File {
     Write-Log "Saved TEMP_ActivityEvents data" -Level Information -Data @{ Rows = $activity.Rows.Count }
 }
 
+# ══════════════════════════════════════════════════════════════════════════════
+#  MODULES  — Load modules from the shared Modules folder, probing both
+#             repo-root and subfolder launch contexts.
+# ══════════════════════════════════════════════════════════════════════════════
 function Import-LocalModule {
-    <#
-    .SYNOPSIS
-    Imports the latest local copy of a module.
-
-    .DESCRIPTION
-    Finds the highest version of a module under the configured modules root
-    and imports it explicitly from its discovered module path.
-    #>
     param (
         [Parameter(Mandatory = $true)]
         [string]$Name,
@@ -667,7 +678,6 @@ function Import-LocalModule {
     Import-Module -Name $availableModule.Path -ErrorAction Stop
 }
 
-# Probe expected module folders so this script can run from either repo root or subfolder contexts.
 $modulePathCandidates = @(
     (Join-Path -Path $PSScriptRoot -ChildPath 'modules'),
     (Join-Path -Path (Split-Path -Path $PSScriptRoot -Parent) -ChildPath 'modules')
@@ -681,28 +691,18 @@ if ([string]::IsNullOrWhiteSpace($modulesRoot)) {
     throw "Local modules folder was not found. Checked: $($modulePathCandidates -join ', ')"
 }
 
-# Ensure local module path is searchable before importing pinned local modules.
 if (($env:PSModulePath -split ';') -notcontains $modulesRoot) {
     $env:PSModulePath = "$modulesRoot;$env:PSModulePath"
 }
 
 Import-LocalModule -Name 'PSLogger' -ModulesRoot $modulesRoot
 
-if (-not (Get-Command -Name Write-Log -ErrorAction SilentlyContinue)) {
-    throw "PSLogger module does not expose Write-Log."
-}
-
-if (-not (Get-Command -Name Set-LogConfiguration -ErrorAction SilentlyContinue)) {
-    throw "PSLogger module does not expose Set-LogConfiguration."
-}
-
 Set-LogConfiguration -MinimumLevel $LogLevel -Console
+
 Import-LocalModule -Name 'SecretStore' -ModulesRoot $modulesRoot
 
-if (-not (Get-Command -Name Get-SecretValue -ErrorAction SilentlyContinue)) {
-    Write-Log "SecretStore Get-SecretValue command is missing" -Level Fatal
-    throw "SecretStore module does not expose Get-SecretValue."
-}
+# ══════════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════════
 
 function Invoke-PbiExportRun {
     <#
@@ -714,7 +714,7 @@ function Invoke-PbiExportRun {
     refreshes configured entities, executes final SQL processing, and returns
     an exit code including handled throttling status.
     #>
-    Write-Log "PBI export run started" -Level Information -Data @{ LogLevel = $LogLevel; DryRun = [bool]$DryRun }
+    Write-Log "PBI export run started" -Level Information -Data @{ LogLevel = $LogLevel; DryRun = [bool]$DryRun; ConnectionStringName = $ConnectionStringName }
 
     $connectedToPowerBI = $false
     $exitCode = 0
@@ -725,14 +725,15 @@ function Invoke-PbiExportRun {
         $secretStoreArgs['MasterPassword'] = $MasterPassword
     }
 
-    if ($PSBoundParameters.ContainsKey('StoreFile')) {
-        $secretStoreArgs['StoreFile'] = $StoreFile
+    if ($PSBoundParameters.ContainsKey('SecretFile')) {
+        $secretStoreArgs['StoreFile'] = $SecretFile
     }
 
     try {
 
         # Resolve all runtime secrets required for SQL and service-principal auth.
-        $connString = Get-SecretValue @secretStoreArgs -Path 'ConnectionStrings:AnalyticsDB'
+        $connStringPath = "ConnectionStrings:$ConnectionStringName"
+        $connString = Get-SecretValue @secretStoreArgs -Path $connStringPath
         $clientId = Get-SecretValue @secretStoreArgs -Path 'AZURE_AD_APP:CLIENTID'
         $clientSecret = Get-SecretValue @secretStoreArgs -Path 'AZURE_AD_APP:CLIENTSECRET'
         $tenantID = Get-SecretValue @secretStoreArgs -Path 'AZURE_AD_APP:TENANTID'
